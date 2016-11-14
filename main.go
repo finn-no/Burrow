@@ -14,12 +14,17 @@ import (
 	"flag"
 	"fmt"
 	log "github.com/cihub/seelog"
+	"github.com/linkedin/Burrow/protocol"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/samuel/go-zookeeper/zk"
 	"os"
 	"os/signal"
 	"runtime"
 	"syscall"
 	"time"
+        "strings"
+        "regexp"
+        "strconv"
 )
 
 type KafkaCluster struct {
@@ -39,6 +44,7 @@ type ApplicationContext struct {
 	Server       *HttpServer
 	NotifyCenter *NotifyCenter
 	NotifierLock *zk.Lock
+        GaugeMetrics map[string]*prometheus.GaugeVec
 }
 
 // Why two mains? Golang doesn't let main() return, which means defers will not run.
@@ -146,6 +152,9 @@ func burrowMain() int {
 	go StartNotifiers(appContext)
 	defer StopNotifiers(appContext)
 
+	appContext.GaugeMetrics = make(map[string]*prometheus.GaugeVec)
+	go appContext.prometheusUpdater()
+
 	// Register signal handlers for exiting
 	exitChannel := make(chan os.Signal, 1)
 	signal.Notify(exitChannel, syscall.SIGINT, syscall.SIGQUIT, syscall.SIGSTOP, syscall.SIGTERM)
@@ -166,4 +175,88 @@ func main() {
 		fmt.Println("Stopped Burrow at", time.Now().Format("January 2, 2006 at 3:04pm (MST)"))
 	}
 	os.Exit(rv)
+}
+
+func (app *ApplicationContext) prometheusUpdater() {
+	for {
+		<-time.After(5 * time.Second)
+		app.UpdatePrometheusMetrics()
+	}
+}
+
+func (ctx *ApplicationContext) GetOrCreateGauge(gaugeName string, gaugeHelp string, labels []string) *prometheus.GaugeVec {
+	metric := ctx.GaugeMetrics[gaugeName]
+	if metric != nil {
+		return metric
+	}
+	gaugeOpts := prometheus.GaugeOpts{
+		Name: gaugeName,
+		Help: gaugeHelp,
+	}
+	gauge := prometheus.NewGaugeVec(
+		gaugeOpts,
+		labels,
+	)
+	prometheus.Register(gauge)
+	ctx.GaugeMetrics[gaugeName] = gauge
+	return gauge
+}
+
+func (app *ApplicationContext) UpdatePrometheusMetrics() {
+	r := regexp.MustCompile("[^a-zA-Z0-9_]+")
+
+	lagGauge := app.GetOrCreateGauge("kafka_lag", "Gauge of lag (messages produces - messages consumed) for a Kafka consumer group", []string{"cluster", "consumer_group", "partition", "topic"})
+	totalLagGauge := app.GetOrCreateGauge("kafka_lag_total", "Gauge of total lag (messages produces - messages consumed) for a Kafka consumer group", []string{"cluster", "consumer_group"})
+	offsetGauge := app.GetOrCreateGauge("kafka_offset", "Gauge of offset for a Kafka consumer group", []string{"cluster", "consumer_group", "partition", "topic"})
+
+	for cluster, _ := range app.Config.Kafka {
+		consumers := getConsumerList(app, cluster)
+		for _, consumer := range consumers {
+
+			consumerStat := getConsumerStatus(app, cluster, consumer)
+
+			// Make the metric/label names acceptable for prometheus
+			clusterProm := strings.Replace(cluster, "-", "_", -1)
+			clusterProm = r.ReplaceAllString(clusterProm, "")
+
+			cgNameProm := strings.Replace(consumer, "-", "_", -1)
+			cgNameProm = r.ReplaceAllString(cgNameProm, "")
+
+			totalLagGauge.WithLabelValues(clusterProm, cgNameProm).Set(float64(consumerStat.TotalLag))
+
+			for _, partition := range consumerStat.Partitions {
+				lagGauge.WithLabelValues(clusterProm, cgNameProm, strconv.FormatInt(int64(partition.Partition), 10), partition.Topic).Set(float64(partition.End.Lag))
+				offsetGauge.WithLabelValues(clusterProm, cgNameProm, strconv.FormatInt(int64(partition.Partition), 10), partition.Topic).Set(float64(partition.End.Offset))
+			}
+		}
+	}
+}
+
+func getConsumerList(app *ApplicationContext, cluster string) []string {
+	storageRequest := &RequestConsumerList{Result: make(chan []string), Cluster: cluster}
+	app.Storage.requestChannel <- storageRequest
+	select {
+	case res := <-storageRequest.Result:
+		return res
+	case <-time.After(10 * time.Second):
+		log.Warn("Timed out after 10 seconds for consumer list response")
+		return []string{}
+	}
+}
+
+func getConsumerStatus(app *ApplicationContext, cluster string, group string) *protocol.ConsumerGroupStatus {
+	storageRequest := &RequestConsumerStatus{
+		Result:  make(chan *protocol.ConsumerGroupStatus),
+		Cluster: cluster,
+		Group:   group,
+		Showall: true,
+	}
+	app.Storage.requestChannel <- storageRequest
+	select {
+	case res := <-storageRequest.Result:
+		return res
+	case <-time.After(10 * time.Second):
+		log.Warn("Timed out after 10 seconds for consumer status response")
+		return nil
+	}
 }

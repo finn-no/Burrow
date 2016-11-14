@@ -14,4 +14,6 @@ ADD docker-config /etc/burrow
 
 WORKDIR /var/tmp/burrow
 
-CMD ["/go/bin/burrow", "--config", "/etc/burrow/burrow.cfg"]
+EXPOSE 80
+
+ENTRYPOINT ["/go/bin/burrow", "--config", "/etc/burrow/burrow.cfg"]
